@@ -1,0 +1,9 @@
+{
+  "totalSignals": 0,
+  "filteredOut": 0,
+  "confidenceHistory": [],
+  "lastUpdate": null,
+  "avgConfidence": 0.5,
+  "bestSignal": null,
+  "worstSignal": null
+}
