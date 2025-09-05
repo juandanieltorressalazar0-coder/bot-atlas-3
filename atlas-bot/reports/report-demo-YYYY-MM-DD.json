@@ -1,0 +1,81 @@
+{
+  "mission": "Kamikaze Rip A.T.L.A.S. - Fase de Calibración (DEMO)",
+  "phase": "demo",
+  "pair": "EUR/USD",
+  "duration": 3,
+  "totalOperations": 180,
+  "startTime": "2025-07-06T04:00:00.000Z",
+  "endTime": "2025-07-06T07:00:00.000Z",
+  "status": "demo_completed",
+  "errors": [],
+  "summary": {
+    "totalTrades": 180,
+    "winTrades": 150,
+    "lossTrades": 30,
+    "winRate": 0.8333,
+    "initialBalance": 1000,
+    "finalBalance": 1500,
+    "profit": 500,
+    "maxDrawdown": 150,
+    "sharpeRatio": 2.5
+  },
+  "riskmap": {
+    "isPaused": false,
+    "lossesInRow": 0,
+    "tradeCount": 180,
+    "maxLossStreak": 3
+  },
+  "compound": {
+    "tradeCount": 180,
+    "currentLotSize": 150.50,
+    "totalCompounds": 18,
+    "avgLotSize": 125.25
+  },
+  "signalrank": {
+    "totalSignals": 180,
+    "filteredOut": 12,
+    "avgConfidence": 0.85,
+    "bestSignal": {
+      "confidence": 0.95,
+      "source": "signalrank-ia",
+      "timestamp": "2025-07-06T04:15:00.000Z"
+    }
+  },
+  "exec": {
+    "tradeCount": 180,
+    "operations": [
+      {
+        "id": "OP-1-1625097600000",
+        "pair": "EUR/USD",
+        "action": "CALL",
+        "amount": 100,
+        "entryPrice": 1.1850,
+        "exitPrice": 1.1860,
+        "result": "win",
+        "profit": 80,
+        "timestamp": "2025-07-06T04:00:00.000Z",
+        "duration": 60
+      },
+      {
+        "id": "OP-2-1625097660000",
+        "pair": "EUR/USD",
+        "action": "PUT",
+        "amount": 100,
+        "entryPrice": 1.1860,
+        "exitPrice": 1.1855,
+        "result": "loss",
+        "profit": -50,
+        "timestamp": "2025-07-06T04:01:00.000Z",
+        "duration": 60
+      }
+    ]
+  },
+  "modules": {
+    "geo-eur": { "status": "active", "sentiment": "neutral", "confidence": 0.65 },
+    "geo-usa": { "status": "active", "sentiment": "positive", "confidence": 0.75 },
+    "tech-ia": { "status": "active", "signals": 180 },
+    "sent-ia": { "status": "active", "sentiment": "neutral", "confidence": 0.70 },
+    "vol-ia": { "status": "active", "volatility": "low" },
+    "news-filter": { "status": "active", "blockedTrades": 3 }
+  }
+}
