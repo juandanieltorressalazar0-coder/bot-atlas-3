@@ -1,0 +1,9 @@
+{
+  "modelType": "logistic-regression",
+  "features": ["rsi", "ema", "sentiment", "volatility"],
+  "weights": [],
+  "bias": 0,
+  "accuracy": 0,
+  "lastTrained": null,
+  "trainingDataSize": 0
+}
