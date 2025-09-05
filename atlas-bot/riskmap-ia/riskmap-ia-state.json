@@ -1,0 +1,12 @@
+{
+  "isPaused": false,
+  "lossesInRow": 0,
+  "tradeCount": 0,
+  "maxLossStreak": 0,
+  "pauseUntil": null,
+  "lastUpdate": null,
+  "balance": 0,
+  "initialBalance": 0,
+  "maxDrawdown": 0,
+  "maxDrawdownPercent": 0
+}
