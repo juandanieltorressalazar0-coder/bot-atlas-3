@@ -1,387 +1,162 @@
 /**
- * atlas-automation.js - Módulo Principal de Automatización para Kamikaze Rip A.T.L.A.S.
- *
- * Función:
- * - Coordinar todos los módulos del sistema.
- * - Gestionar las fases de calibración (demo) y ejecución real.
- * - Monitorear el estado general del sistema.
- * - Generar informes de ejecución.
+ * atlas-automation.js - Módulo Orquestador Principal para A.T.L.A.S. (Versión Integrada)
  */
 
+// === 1. IMPORTS Y CONFIGURACIÓN INICIAL ===
 require('dotenv').config();
-const fs = require('fs').promises;
+const express = require('express');
 const path = require('path');
-const winston = require('winston');
-const { delay } = require('./utils/helpers-ia');
+const { readJsonFile, saveJsonFile, fileExists, setupLogger, delay } = require('./utils/helpers');
+const { fetchWithRetry } = require('./utils/network-helpers');
 
-// === MÓDULOS ===
+// Importar todos los módulos de IA y ejecución
 const execIA = require('./exec-ia/exec-ia');
-const riskMapIA = require('./riskmap-ia/riskmap-ia');
 const signalRankIA = require('./signalrank-ia/signalrank-ia');
+const riskmapIA = require('./riskmap-ia/riskmap-ia');
 const techIA = require('./tech-ia/tech-ia');
-const sentIA = require('./sent-ia/sent-ia');
-const volIA = require('./vol-ia/vol-ia');
-const geoEUR = require('./geo-eur/geo-eur');
-const geoUSA = require('./geo-usa/geo-usa');
-const newsFilter = require('./news-filter/news-filter');
+const compoundLogic = require('./compound-logic/compound-logic');
 const scraping = require('./scraping/scraping-forexfactory');
 
-// === CONFIGURACIÓN ===
+
+// === 2. CONFIGURACIÓN CENTRALIZADA ===
 const config = {
-  PHASE: process.env.PHASE || 'demo', // demo o real
-  PAIR: process.env.PAIR || 'EURUSD',
-  DURATION: parseInt(process.env.DURATION) || 3, // horas
-  TOTAL_OPERATIONS: parseInt(process.env.TOTAL_OPERATIONS) || 180,
-  OPERATION_INTERVAL: parseInt(process.env.OPERATION_INTERVAL) || 60000, // 1 minuto
-  LOG_FILE: path.join(__dirname, 'logs', 'automation.log'),
-  REPORT_DIR: path.join(__dirname, 'reports'),
+  port: process.env.PORT || 3000,
+  backtestMode: process.env.BACKTEST_MODE === 'true',
+  logLevel: process.env.LOG_LEVEL || 'info',
+  operationInterval: parseInt(process.env.OPERATION_INTERVAL, 10) || 60000,
+  minSignalScore: parseFloat(process.env.MIN_SIGNAL_SCORE) || 0.7,
+  stateFilePath: path.join(__dirname, 'automation-state.json'),
+  logFilePath: path.join(__dirname, 'logs', 'automation.log'),
+  symbol: process.env.SYMBOL || 'EURUSD',
+  bankroll: parseFloat(process.env.DEFAULT_BANKROLL) || 1000,
 };
 
-// === LOGGING ===
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.json()
-  ),
-  transports: [
-    new winston.transports.File({ filename: config.LOG_FILE }),
-    new winston.transports.Console(),
-  ],
-});
+// === 3. LOGGER ===
+const logger = setupLogger('atlas-automation', config.logFilePath);
+logger.level = config.logLevel;
 
-// === ESTADO DEL SISTEMA ===
+// === 4. GESTIÓN DE ESTADO ===
 let systemState = {
-  phase: config.PHASE,
-  pair: config.PAIR,
-  duration: config.DURATION,
-  totalOperations: config.TOTAL_OPERATIONS,
-  operationCount: 0,
-  winCount: 0,
-  lossCount: 0,
-  startTime: null,
-  endTime: null,
-  status: 'initializing',
-  errors: [],
-  modules: {
-    'exec-ia': { status: 'idle' },
-    'riskmap-ia': { status: 'idle' },
-    'signalrank-ia': { status: 'idle' },
-    'tech-ia': { status: 'idle' },
-    'sent-ia': { status: 'idle' },
-    'vol-ia': { status: 'idle' },
-    'geo-eur': { status: 'idle' },
-    'geo-usa': { status: 'idle' },
-    'news-filter': { status: 'idle' },
-    'scraping': { status: 'idle' },
-  },
+  lastRun: null,
+  isCycleRunning: false,
+  // El estado de las operaciones abiertas se gestiona en exec-ia,
+  // pero podríamos tener un resumen aquí si fuera necesario.
+  stats: { wins: 0, losses: 0, total: 0 },
+  version: '2.1.0', // Versión integrada
 };
 
-// === INICIALIZAR MÓDULOS ===
-async function initModules() {
+// === 5. LÓGICA DE TRADING (CICLO ÚNICO) ===
+async function runTradingCycle() {
+  if (systemState.isCycleRunning) {
+    logger.warn('El ciclo de trading anterior todavía está en ejecución. Omitiendo este ciclo.');
+    return;
+  }
+  systemState.isCycleRunning = true;
+  logger.info(`--- Iniciando nuevo ciclo de trading para ${config.symbol} ---`);
+
   try {
-    logger.info('🚀 Inicializando módulos...');
+    // 1. Chequear resultados de operaciones abiertas
+    const openTrades = execIA.getOpenTrades();
+    for (const trade of openTrades) {
+      const result = await execIA.checkTradeResult(trade);
+      if (result.status === 'closed') {
+        logger.info(`Operación ${trade.tradeId} cerrada. Resultado: ${result.result}, Ganancia: ${result.profit}`);
+        systemState.stats.total++;
+        if (result.result === 'win') systemState.stats.wins++; else systemState.stats.losses++;
+        config.bankroll += result.profit; // Actualizar bankroll
+        await execIA.removeTrade(trade.tradeId);
+      }
+    }
 
-    // Inicializar módulos en paralelo
-    await Promise.all([
-      execIA.initExecutionModule(),
-      riskMapIA.initRiskMapIA(),
-      signalRankIA.initSignalRankIA(),
-      techIA.initTechIA(),
-      sentIA.initSentIA(),
-      volIA.initVolIA(),
-      geoEUR.initGeoEUR(),
-      geoUSA.initGeoUSA(),
-      newsFilter.initNewsFilter(),
-      scraping.initScraping(),
-    ]);
+    // 2. Obtener datos y señales
+    const upcomingEvents = await scraping.getUpcomingHighImpactEvents(60);
+    // Para una implementación real, aquí se obtendrían datos OHLCV frescos.
+    // Para este ejemplo, asumimos que techIA puede obtenerlos o se le pasan.
+    // const ohlcv = await getFreshOHLCV();
+    const indicators = techIA.computeIndicators(/* ohlcv */); // Placeholder
 
-    // Actualizar estado del sistema
-    systemState.status = 'modules_ready';
-    Object.keys(systemState.modules).forEach(module => {
-      systemState.modules[module].status = 'active';
+    // 3. Evaluar riesgo
+    const riskAssessment = riskmapIA.assessRisk({ upcomingEvents, indicators });
+    if (!riskAssessment.allowed) {
+      logger.warn(`Operación denegada por gestor de riesgo: ${riskAssessment.reason}`);
+      systemState.isCycleRunning = false;
+      return;
+    }
+
+    // 4. Obtener puntuación de la señal
+    const finalSignal = signalRankIA.getFinalScore({
+      signals: { tech: { score: 0.8, direction: 'CALL' } }, // Placeholder de señal
+      openTrades: execIA.getOpenTrades(),
+      // lastTradeTimes se debería gestionar en el estado del sistema
+      symbol: config.symbol,
     });
 
-    logger.info('✅ Todos los módulos inicializados correctamente.');
-  } catch (error) {
-    logger.error(`❌ Error al inicializar módulos: ${error.message}`);
-    systemState.status = 'initialization_error';
-    systemState.errors.push({ message: error.message, timestamp: new Date().toISOString() });
-    throw error;
-  }
-}
+    // 5. Decidir y ejecutar
+    if (finalSignal.finalScore >= config.minSignalScore) {
+      logger.info(`Señal fuerte (${finalSignal.finalScore.toFixed(2)}) y riesgo aceptado. Procediendo a operar.`);
 
-// === EJECUTAR FASE DE CALIBRACIÓN (DEMO) ===
-async function runDemoPhase() {
-  try {
-    logger.info('🎯 Iniciando fase de calibración (DEMO)...');
-    systemState.status = 'demo_running';
-    systemState.startTime = new Date().toISOString();
+      const stake = compoundLogic.calculateStake({
+        bankroll: config.bankroll,
+        recommendedStakePct: riskAssessment.recommendedStakePct,
+      });
 
-    // Simular balance inicial
-    const initialBalance = 1000;
-    await riskMapIA.initBalance(initialBalance);
+      await execIA.placeTrade({
+        symbol: config.symbol,
+        direction: finalSignal.direction,
+        stake,
+        expiryMinutes: 5,
+      });
 
-    // Ejecutar operaciones de demo
-    for (let i = 0; i < config.TOTAL_OPERATIONS; i++) {
-      systemState.operationCount = i + 1;
-
-      // Verificar si el bot está pausado
-      const riskStatus = riskMapIA.checkStatus();
-      if (riskStatus.isPaused) {
-        logger.warn(`⏸️ Operación ${i + 1}: Bot pausado hasta ${riskStatus.pauseUntil}.`);
-        await delay(60000); // Esperar 1 minuto
-        continue;
-      }
-
-      // Obtener señales de todos los módulos
-      const techSignal = techIA.getCurrentSignal();
-      const sentSignal = sentIA.getCurrentSentiment();
-      const volSignal = volIA.getCurrentSignal();
-      const geoEURSignal = geoEUR.getCurrentSignal();
-      const geoUSASignal = geoUSA.getCurrentSignal();
-
-      // Fusionar señales
-      const signals = [
-        { ...techSignal, source: 'tech-ia' },
-        { action: sentSignal.sentiment === 'positive' ? 'CALL' : 'PUT', confidence: sentSignal.confidence, source: 'sent-ia' },
-        { action: volSignal.recommendation === 'reduce_lot_size' ? 'PUT' : 'CALL', confidence: volSignal.confidence, source: 'vol-ia' },
-        { ...geoEURSignal, source: 'geo-eur' },
-        { ...geoUSASignal, source: 'geo-usa' },
-      ];
-
-      const fusedSignal = signalRankIA.fuseSignals(signals);
-
-      // Verificar ventana de noticias
-      const newsStatus = newsFilter.getCurrentStatus();
-      if (newsStatus.isNewsWindowActive) {
-        logger.warn(`📰 Operación ${i + 1}: Ventana de noticias activa. Operación cancelada.`);
-        continue;
-      }
-
-      // Ejecutar operación
-      const operation = await execIA.executeTrade(fusedSignal);
-
-      // Registrar resultado
-      if (operation.result === 'win') {
-        systemState.winCount++;
-      } else {
-        systemState.lossCount++;
-      }
-
-      // Actualizar balance y estado de riesgo
-      const newBalance = await execIA.getBalance();
-      await riskMapIA.updateBalance(newBalance);
-      riskMapIA.registerTrade(operation.result);
-
-      logger.info(`📊 Operación ${i + 1}: ${operation.result.toUpperCase()}. Balance: $${newBalance.toFixed(2)}`);
-
-      // Esperar intervalo entre operaciones
-      if (i < config.TOTAL_OPERATIONS - 1) {
-        await delay(config.OPERATION_INTERVAL);
-      }
-    }
-
-    // Finalizar fase de demo
-    systemState.status = 'demo_completed';
-    systemState.endTime = new Date().toISOString();
-    const finalBalance = await execIA.getBalance();
-
-    logger.info(`🏁 Fase de calibración (DEMO) completada. Operaciones: ${config.TOTAL_OPERATIONS}. Ganadas: ${systemState.winCount}. Perdidas: ${systemState.lossCount}. Balance final: $${finalBalance.toFixed(2)}`);
-
-    // Generar informe
-    await generateReport('demo');
-  } catch (error) {
-    logger.error(`❌ Error en fase de calibración: ${error.message}`);
-    systemState.status = 'demo_error';
-    systemState.errors.push({ message: error.message, timestamp: new Date().toISOString() });
-    throw error;
-  }
-}
-
-// === EJECUTAR FASE REAL ===
-async function runRealPhase() {
-  try {
-    logger.info('🚀 Iniciando fase real...');
-    systemState.status = 'real_running';
-    systemState.startTime = new Date().toISOString();
-
-    // Obtener balance inicial real
-    const initialBalance = await execIA.getBalance();
-    await riskMapIA.initBalance(initialBalance);
-
-    // Ejecutar operaciones en tiempo real
-    for (let i = 0; i < config.TOTAL_OPERATIONS; i++) {
-      systemState.operationCount = i + 1;
-
-      // Verificar si el bot está pausado
-      const riskStatus = riskMapIA.checkStatus();
-      if (riskStatus.isPaused) {
-        logger.warn(`⏸️ Operación ${i + 1}: Bot pausado hasta ${riskStatus.pauseUntil}.`);
-        await delay(60000); // Esperar 1 minuto
-        continue;
-      }
-
-      // Obtener señales de todos los módulos
-      const techSignal = techIA.getCurrentSignal();
-      const sentSignal = sentIA.getCurrentSentiment();
-      const volSignal = volIA.getCurrentSignal();
-      const geoEURSignal = geoEUR.getCurrentSignal();
-      const geoUSASignal = geoUSA.getCurrentSignal();
-
-      // Fusionar señales
-      const signals = [
-        { ...techSignal, source: 'tech-ia' },
-        { action: sentSignal.sentiment === 'positive' ? 'CALL' : 'PUT', confidence: sentSignal.confidence, source: 'sent-ia' },
-        { action: volSignal.recommendation === 'reduce_lot_size' ? 'PUT' : 'CALL', confidence: volSignal.confidence, source: 'vol-ia' },
-        { ...geoEURSignal, source: 'geo-eur' },
-        { ...geoUSASignal, source: 'geo-usa' },
-      ];
-
-      const fusedSignal = signalRankIA.fuseSignals(signals);
-
-      // Verificar ventana de noticias
-      const newsStatus = newsFilter.getCurrentStatus();
-      if (newsStatus.isNewsWindowActive) {
-        logger.warn(`📰 Operación ${i + 1}: Ventana de noticias activa. Operación cancelada.`);
-        continue;
-      }
-
-      // Ejecutar operación
-      const operation = await execIA.executeTrade(fusedSignal);
-
-      // Registrar resultado
-      if (operation.result === 'win') {
-        systemState.winCount++;
-      } else {
-        systemState.lossCount++;
-      }
-
-      // Actualizar balance y estado de riesgo
-      const newBalance = await execIA.getBalance();
-      await riskMapIA.updateBalance(newBalance);
-      riskMapIA.registerTrade(operation.result);
-
-      logger.info(`📊 Operación ${i + 1}: ${operation.result.toUpperCase()}. Balance: $${newBalance.toFixed(2)}`);
-
-      // Esperar intervalo entre operaciones
-      if (i < config.TOTAL_OPERATIONS - 1) {
-        await delay(config.OPERATION_INTERVAL);
-      }
-    }
-
-    // Finalizar fase real
-    systemState.status = 'real_completed';
-    systemState.endTime = new Date().toISOString();
-    const finalBalance = await execIA.getBalance();
-
-    logger.info(`🏁 Fase real completada. Operaciones: ${config.TOTAL_OPERATIONS}. Ganadas: ${systemState.winCount}. Perdidas: ${systemState.lossCount}. Balance final: $${finalBalance.toFixed(2)}`);
-
-    // Generar informe
-    await generateReport('real');
-  } catch (error) {
-    logger.error(`❌ Error en fase real: ${error.message}`);
-    systemState.status = 'real_error';
-    systemState.errors.push({ message: error.message, timestamp: new Date().toISOString() });
-    throw error;
-  }
-}
-
-// === GENERAR INFORME ===
-async function generateReport(phase) {
-  try {
-    const report = {
-      mission: `Kamikaze Rip A.T.L.A.S. - Fase ${phase === 'demo' ? 'de Calibración (DEMO)' : 'Real'}`,
-      phase,
-      pair: config.PAIR,
-      duration: config.DURATION,
-      totalOperations: config.TOTAL_OPERATIONS,
-      startTime: systemState.startTime,
-      endTime: systemState.endTime,
-      status: `${phase}_completed`,
-      errors: systemState.errors,
-      summary: {
-        totalTrades: systemState.operationCount,
-        winTrades: systemState.winCount,
-        lossTrades: systemState.lossCount,
-        winRate: systemState.winCount / systemState.operationCount,
-        initialBalance: await execIA.getBalance() - (await riskMapIA.getState()).profit,
-        finalBalance: await execIA.getBalance(),
-        profit: (await riskMapIA.getState()).profit,
-        maxDrawdown: (await riskMapIA.getState()).maxDrawdown,
-      },
-      riskmap: await riskMapIA.getState(),
-      compound: { tradeCount: systemState.operationCount },
-      signalrank: await signalRankIA.getCurrentState(),
-      exec: await execIA.getState(),
-      modules: {
-        'geo-eur': await geoEUR.getState(),
-        'geo-usa': await geoUSA.getState(),
-        'tech-ia': await techIA.getState(),
-        'sent-ia': await sentIA.getState(),
-        'vol-ia': await volIA.getState(),
-        'news-filter': await newsFilter.getState(),
-      },
-    };
-
-    // Crear directorio de informes si no existe
-    if (!(await fileExists(config.REPORT_DIR))) {
-      await fs.mkdir(config.REPORT_DIR, { recursive: true });
-    }
-
-    // Guardar informe
-    const reportFile = path.join(config.REPORT_DIR, `report-${phase}-${new Date().toISOString().split('T')[0]}.json`);
-    await saveJsonFile(reportFile, report);
-
-    logger.info(`📄 Informe generado: ${reportFile}`);
-  } catch (error) {
-    logger.error(`❌ Error al generar informe: ${error.message}`);
-    throw error;
-  }
-}
-
-// === VERIFICAR SI EXISTE ARCHIVO ===
-async function fileExists(filePath) {
-  try {
-    await fs.access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// === GUARDAR ARCHIVO JSON ===
-async function saveJsonFile(filePath, data) {
-  try {
-    const tempFile = `${filePath}.tmp`;
-    await fs.writeFile(tempFile, JSON.stringify(data, null, 2));
-    await fs.rename(tempFile, filePath);
-  } catch (error) {
-    throw new Error(`Error al guardar ${filePath}: ${error.message}`);
-  }
-}
-
-// === INICIAR AUTOMATIZACIÓN ===
-async function startAutomation() {
-  try {
-    logger.info('🌐 Iniciando automatización de Kamikaze Rip A.T.L.A.S.');
-
-    // Inicializar módulos
-    await initModules();
-
-    // Ejecutar fase según configuración
-    if (config.PHASE === 'demo') {
-      await runDemoPhase();
     } else {
-      await runRealPhase();
+      logger.info(`La puntuación de la señal (${finalSignal.finalScore.toFixed(2)}) no supera el umbral (${config.minSignalScore}).`);
     }
 
-    logger.info('🎉 Automatización finalizada.');
   } catch (error) {
-    logger.error(`❌ Error en automatización: ${error.message}`);
-    process.exit(1);
+    logger.error('Ocurrió un error durante el ciclo de trading.', error);
+  } finally {
+    systemState.lastRun = new Date().toISOString();
+    systemState.isCycleRunning = false;
+    logger.info('--- Ciclo de trading finalizado ---');
   }
 }
 
-// === INICIAR ===
-startAutomation();
+// === 6. SERVIDOR WEB (EXPRESS) ===
+const app = express();
+app.get('/health', (req, res) => res.status(200).json({ status: 'ok', ...systemState }));
+app.get('/status', (req, res) => res.status(200).json({ systemState, openTrades: execIA.getOpenTrades() }));
+
+// === 7. ARRANQUE Y APAGADO SEGURO ===
+async function start() {
+  logger.info('*** Iniciando A.T.L.A.S. ***');
+
+  // Cargar estado de los módulos que lo necesiten
+  await execIA.init();
+  await scraping.initScraping();
+  // ... otros inits si fueran necesarios
+
+  // Iniciar el ciclo de trading programado
+  setInterval(runTradingCycle, config.operationInterval);
+
+  // Iniciar el servidor web
+  app.listen(config.port, () => {
+    logger.info(`Servidor escuchando en http://localhost:${config.port}`);
+    logger.info(`Bot operando en modo: ${config.backtestMode ? 'BACKTEST' : 'LIVE'}`);
+  });
+}
+
+async function gracefulShutdown() {
+  logger.warn('Iniciando apagado seguro del sistema...');
+  await saveJsonFile(config.stateFilePath, systemState);
+  // Aquí también se podrían guardar los estados de otros módulos si fuera necesario.
+  logger.info('Apagado completado.');
+  process.exit(0);
+}
+
+process.on('SIGINT', gracefulShutdown);
+process.on('SIGTERM', gracefulShutdown);
+
+// === 8. INICIAR EL BOT ===
+start().catch(error => {
+  logger.error('Fallo catastrófico durante el arranque.', error);
+  process.exit(1);
+});

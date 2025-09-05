@@ -1,234 +1,111 @@
 /**
- * signalrank-ia.js - Módulo de Fusión de Señales para Kamikaze Rip A.T.L.A.S.
+ * signalrank-ia.js - Módulo de Ranking de Señales y Decisión (Versión Refactorizada)
  *
  * Función:
- * - Recibir señales de múltiples fuentes.
- * - Filtrar y fusionar señales para mejorar la confianza.
- * - Proporcionar una señal consolidada para la ejecución.
- * - Persistir el estado en disco.
+ * - Combinar las puntuaciones de múltiples módulos de análisis en una única puntuación final.
+ * - Aplicar una fórmula de ponderación configurable.
+ * - Implementar lógica de cooldown y de-duplicación para evitar sobreoperar.
+ * - Este módulo es stateless.
  */
 
-const fs = require('fs').promises;
-const path = require('path');
-const winston = require('winston');
+require('dotenv').config();
 
 // === CONFIGURACIÓN ===
 const config = {
-  STATE_FILE: path.join(__dirname, 'signalrank-ia-state.json'),
-  LOG_FILE: path.join(__dirname, 'signalrank-ia.log'),
-  MIN_CONFIDENCE: 0.7, // Confianza mínima para aceptar una señal
-  MAX_SIGNAL_AGE: 300000, // 5 minutos en milisegundos
-  SOURCES: ['geo-eur', 'geo-usa', 'tech-ia', 'sent-ia', 'vol-ia'],
+  // Pesos para cada fuente de señal. La suma no tiene por qué ser 1.
+  weights: {
+    tech: parseFloat(process.env.WEIGHT_TECH) || 0.5,
+    sent: parseFloat(process.env.WEIGHT_SENT) || 0.2,
+    pred: parseFloat(process.env.WEIGHT_PRED) || 0.2,
+    // La volatilidad no es una señal, sino un penalizador.
+    volatilityPenalty: parseFloat(process.env.WEIGHT_VOL_PENALTY) || 0.1,
+  },
+  // Umbral mínimo para considerar una operación.
+  minSignalScore: parseFloat(process.env.MIN_SIGNAL_SCORE) || 0.7,
+  // Minutos a esperar antes de abrir otra operación en el mismo par y dirección.
+  cooldownMinutes: parseInt(process.env.COOLDOWN_MINUTES, 10) || 15,
 };
 
-// === LOGGING ===
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.json()
-  ),
-  transports: [
-    new winston.transports.File({ filename: config.LOG_FILE }),
-    new winston.transports.Console(),
-  ],
-});
-
-// === ESTADO DEL MÓDULO ===
-let state = {
-  totalSignals: 0,
-  filteredOut: 0,
-  confidenceHistory: [],
-  lastUpdate: null,
-  avgConfidence: 0.5,
-  bestSignal: null,
-  worstSignal: null,
-};
-
-// === CARGAR ESTADO DESDE DISCO ===
-async function loadState() {
-  try {
-    if (await fileExists(config.STATE_FILE)) {
-      const data = await fs.readFile(config.STATE_FILE, 'utf8');
-      const saved = JSON.parse(data);
-
-      // Restaurar solo campos clave con validación
-      state.totalSignals = saved.totalSignals || 0;
-      state.filteredOut = saved.filteredOut || 0;
-      state.confidenceHistory = saved.confidenceHistory || [];
-      state.lastUpdate = saved.lastUpdate || null;
-      state.avgConfidence = saved.avgConfidence || 0.5;
-      state.bestSignal = saved.bestSignal || null;
-      state.worstSignal = saved.worstSignal || null;
-
-      logger.info(`🟢 SignalRank-IA: Estado cargado. Señales procesadas: ${state.totalSignals}`);
-    } else {
-      // Inicializar con valores por defecto
-      await saveState();
-      logger.info('🆕 SignalRank-IA: Estado inicial creado.');
-    }
-  } catch (error) {
-    logger.error(`⚠️ Error al cargar estado: ${error.message}`);
-    // Crear estado limpio en caso de error
-    await saveState();
+/**
+ * Calcula la puntuación final para una oportunidad de trading.
+ *
+ * @param {object} params - Parámetros para el cálculo.
+ * @param {object} params.signals - Objeto con las señales de los diferentes módulos.
+ *   Ej: { tech: { score: 0.8, direction: 'CALL' }, sent: { score: 0.6 }, ... }
+ * @param {Array} params.openTrades - Array de operaciones actualmente abiertas.
+ *   Ej: [{ symbol: 'EURUSD', direction: 'CALL', ... }]
+ * @param {object} params.lastTradeTimes - Objeto que mapea 'symbol-direction' a un timestamp.
+ *   Ej: { 'EURUSD-CALL': 1678886400000 }
+ * @param {string} params.symbol - El símbolo del activo a evaluar, ej: 'EURUSD'.
+ *
+ * @returns {{finalScore: number, direction: string, reason: string}}
+ */
+function getFinalScore({ signals, openTrades = [], lastTradeTimes = {}, symbol }) {
+  // La dirección principal la dicta la señal técnica, que es la más fuerte.
+  const primaryDirection = signals.tech?.direction;
+  if (!primaryDirection || primaryDirection === 'HOLD') {
+    return { finalScore: 0, direction: 'HOLD', reason: 'La señal técnica principal es HOLD.' };
   }
-}
 
-// === GUARDAR ESTADO EN DISCO ===
-async function saveState() {
-  try {
-    state.lastUpdate = new Date().toISOString();
-    const tempFile = `${config.STATE_FILE}.tmp`;
-    await fs.writeFile(tempFile, JSON.stringify(state, null, 2));
-    await fs.rename(tempFile, config.STATE_FILE);
-  } catch (error) {
-    logger.error(`❌ Error al guardar estado: ${error.message}`);
+  // 1. De-duplicación: No operar si ya hay una operación abierta en la misma dirección.
+  const hasOpenTrade = openTrades.some(
+    trade => trade.symbol === symbol && trade.direction === primaryDirection
+  );
+  if (hasOpenTrade) {
+    return { finalScore: 0, direction: 'HOLD', reason: `Ya hay una operación ${primaryDirection} abierta para ${symbol}.` };
   }
-}
 
-// === VERIFICAR SI EXISTE ARCHIVO ===
-async function fileExists(filePath) {
-  try {
-    await fs.access(filePath);
-    return true;
-  } catch {
-    return false;
+  // 2. Cooldown: No operar si se ha hecho una operación reciente en la misma dirección.
+  const cooldownKey = `${symbol}-${primaryDirection}`;
+  const lastTradeTime = lastTradeTimes[cooldownKey];
+  if (lastTradeTime) {
+    const now = Date.now();
+    const diffMinutes = (now - lastTradeTime) / (1000 * 60);
+    if (diffMinutes < config.cooldownMinutes) {
+      return {
+        finalScore: 0,
+        direction: 'HOLD',
+        reason: `Cooldown activo para ${symbol} ${primaryDirection}. Esperando ${(config.cooldownMinutes - diffMinutes).toFixed(1)} min.`,
+      };
+    }
   }
-}
 
-// === PROCESAR SEÑAL ===
-function processSignal(signal) {
-  try {
-    state.totalSignals++;
+  // 3. Algoritmo de Puntuación Ponderada
+  let finalScore = 0;
+  let reason = 'Puntuación base:';
 
-    // Validar señal
-    if (!signal || !signal.action || !signal.source || signal.confidence === undefined) {
-      state.filteredOut++;
-      logger.warn(`⚠️ SignalRank-IA: Señal inválida de ${signal.source}. Filtrada.`);
-      return null;
-    }
+  // Normalizar scores: si la dirección de una señal secundaria no coincide, su score se vuelve negativo.
+  const techScore = signals.tech?.score || 0;
+  const sentScore = (signals.sent?.direction === primaryDirection ? 1 : -1) * (signals.sent?.score || 0);
+  const predScore = (signals.pred?.direction === primaryDirection ? 1 : -1) * (signals.pred?.score || 0);
 
-    // Validar edad de la señal
-    const signalAge = Date.now() - new Date(signal.timestamp).getTime();
-    if (signalAge > config.MAX_SIGNAL_AGE) {
-      state.filteredOut++;
-      logger.warn(`⚠️ SignalRank-IA: Señal de ${signal.source} demasiado antigua (${signalAge}ms). Filtrada.`);
-      return null;
-    }
+  finalScore =
+    (config.weights.tech * techScore) +
+    (config.weights.sent * sentScore) +
+    (config.weights.pred * predScore);
 
-    // Validar confianza mínima
-    if (signal.confidence < config.MIN_CONFIDENCE) {
-      state.filteredOut++;
-      logger.warn(`⚠️ SignalRank-IA: Señal de ${signal.source} con baja confianza (${signal.confidence}). Filtrada.`);
-      return null;
-    }
+  reason += ` | Tech: ${(config.weights.tech * techScore).toFixed(2)}`;
+  reason += ` | Sent: ${(config.weights.sent * sentScore).toFixed(2)}`;
+  reason += ` | Pred: ${(config.weights.pred * predScore).toFixed(2)}`;
 
-    // Registrar confianza en el historial
-    state.confidenceHistory.push(signal.confidence);
+  // 4. Aplicar penalizador de volatilidad (si existe)
+  // Se asume que vol.penalty es un valor entre 0 y 1.
+  const volPenalty = signals.vol?.penalty || 0;
+  finalScore -= (config.weights.volatilityPenalty * volPenalty);
+  reason += ` | Vol Penalty: ${-(config.weights.volatilityPenalty * volPenalty).toFixed(2)}`;
 
-    // Actualizar mejor y peor señal
-    if (!state.bestSignal || signal.confidence > state.bestSignal.confidence) {
-      state.bestSignal = signal;
-    }
-    if (!state.worstSignal || signal.confidence < state.worstSignal.confidence) {
-      state.worstSignal = signal;
-    }
+  // 5. Normalizar el score final para que esté entre 0 y 1.
+  const normalizedScore = Math.max(0, Math.min(1, finalScore));
 
-    // Calcular confianza promedio
-    const totalConfidence = state.confidenceHistory.reduce((sum, conf) => sum + conf, 0);
-    state.avgConfidence = totalConfidence / state.confidenceHistory.length;
-
-    await saveState();
-    logger.info(`📊 SignalRank-IA: Señal procesada de ${signal.source}. Acción: ${signal.action}. Confianza: ${signal.confidence}`);
-
-    return signal;
-  } catch (error) {
-    logger.error(`❌ Error al procesar señal: ${error.message}`);
-    return null;
+  // 6. Aplicar el umbral final
+  if (normalizedScore < config.minSignalScore) {
+    reason = `Puntuación final (${normalizedScore.toFixed(2)}) por debajo del umbral (${config.minSignalScore}). | ` + reason;
+    return { finalScore: normalizedScore, direction: 'HOLD', reason };
   }
+
+  return { finalScore: normalizedScore, direction: primaryDirection, reason };
 }
 
-// === FUSIONAR SEÑALES ===
-function fuseSignals(signals) {
-  try {
-    if (!signals || signals.length === 0) {
-      logger.warn('⚠️ SignalRank-IA: No hay señales para fusionar.');
-      return null;
-    }
-
-    // Filtrar señales válidas
-    const validSignals = signals.filter(signal => signal !== null);
-
-    if (validSignals.length === 0) {
-      logger.warn('⚠️ SignalRank-IA: Todas las señales fueron filtradas.');
-      return null;
-    }
-
-    // Calcular confianza promedio ponderada
-    const totalWeightedConfidence = validSignals.reduce((sum, signal) => {
-      let weight = 1.0;
-      if (signal.source === 'tech-ia') weight = 1.2; // Mayor peso para señales técnicas
-      return sum + (signal.confidence * weight);
-    }, 0);
-
-    const totalWeight = validSignals.reduce((sum, signal) => {
-      return sum + (signal.source === 'tech-ia' ? 1.2 : 1.0);
-    }, 0);
-
-    const avgConfidence = totalWeightedConfidence / totalWeight;
-
-    // Determinar acción predominante
-    const callCount = validSignals.filter(signal => signal.action === 'CALL').length;
-    const putCount = validSignals.filter(signal => signal.action === 'PUT').length;
-    const action = callCount >= putCount ? 'CALL' : 'PUT';
-
-    // Crear señal fusionada
-    const fusedSignal = {
-      action,
-      confidence: avgConfidence,
-      source: 'signalrank-ia',
-      timestamp: new Date().toISOString(),
-      details: {
-        signals: validSignals,
-        callCount,
-        putCount,
-      },
-    };
-
-    // Procesar la señal fusionada
-    processSignal(fusedSignal);
-
-    logger.info(`🔀 SignalRank-IA: Señal fusionada. Acción: ${action}. Confianza: ${avgConfidence.toFixed(2)}`);
-    return fusedSignal;
-  } catch (error) {
-    logger.error(`❌ Error al fusionar señales: ${error.message}`);
-    return null;
-  }
-}
-
-// === OBTENER ESTADO ACTUAL ===
-function getCurrentState() {
-  return {
-    totalSignals: state.totalSignals,
-    filteredOut: state.filteredOut,
-    avgConfidence: state.avgConfidence,
-    bestSignal: state.bestSignal,
-    worstSignal: state.worstSignal,
-    lastUpdate: state.lastUpdate,
-  };
-}
-
-// === INICIALIZAR MÓDULO ===
-async function initSignalRankIA() {
-  await loadState();
-  logger.info('🟢 SignalRank-IA: Módulo de fusión de señales iniciado.');
-}
-
-// === EXPORTAR MÓDULO ===
 module.exports = {
-  initSignalRankIA,
-  processSignal,
-  fuseSignals,
-  getCurrentState,
-  getState: () => ({ ...state }),
+  getFinalScore,
 };
