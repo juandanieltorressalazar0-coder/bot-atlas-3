@@ -1,216 +1,82 @@
 /**
- * riskmap-ia.js - Módulo de Gestión de Riesgo para Kamikaze Rip A.T.L.A.S.
+ * riskmap-ia.js - Módulo de Evaluación de Riesgo de Mercado (Versión Refactorizada)
  *
  * Función:
- * - Gestionar el riesgo de las operaciones.
- * - Pausar el bot después de 3 pérdidas consecutivas.
- * - Limitar el tamaño de las operaciones al 10% del balance.
- * - Monitorear el drawdown máximo.
- * - Persistir el estado en disco.
+ * - Evaluar el riesgo de una potencial operación ANTES de que se ejecute.
+ * - Considerar la volatilidad del mercado (ATR) y los eventos de noticias de alto impacto.
+ * - Determinar si una operación está permitida y recomendar el porcentaje de capital a arriesgar.
+ * - Este módulo es stateless.
  */
 
-const fs = require('fs').promises;
+require('dotenv').config();
 const path = require('path');
-const winston = require('winston');
+const { setupLogger } = require('../utils/helpers');
 
 // === CONFIGURACIÓN ===
 const config = {
-  STATE_FILE: path.join(__dirname, 'riskmap-ia-state.json'),
-  LOG_FILE: path.join(__dirname, 'riskmap-ia.log'),
-  MAX_LOSS_STREAK: 3, // Número máximo de pérdidas consecutivas antes de pausar
-  PAUSE_DURATION: 15, // Minutos de pausa después de alcanzar MAX_LOSS_STREAK
-  RISK_PERCENT: 0.10, // 10% del balance por operación
-  MAX_DRAWDOWN_PERCENT: 0.20, // 20% de drawdown máximo permitido
+  // Ventana de tiempo (en minutos) antes y después de una noticia para no operar.
+  newsWindowMinutes: parseInt(process.env.NEWS_WINDOW_MINUTES, 10) || 30,
+  // Porcentaje de riesgo por defecto, tomado del .env
+  defaultRiskPct: parseFloat(process.env.MAX_RISK_PCT) || 1.0,
+  // Porcentaje de riesgo reducido cuando la volatilidad es alta.
+  reducedRiskPct: (parseFloat(process.env.MAX_RISK_PCT) || 1.0) / 2,
+  // Umbral de ATR (ej. en pips * 10) para considerar la volatilidad como alta.
+  // Este valor es muy dependiente del par y del timeframe, necesita calibración.
+  maxAtrThreshold: parseFloat(process.env.MAX_ATR_THRESHOLD) || 150,
 };
 
-// === LOGGING ===
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.json()
-  ),
-  transports: [
-    new winston.transports.File({ filename: config.LOG_FILE }),
-    new winston.transports.Console(),
-  ],
-});
+const logger = setupLogger('riskmap-ia', path.join(__dirname, 'logs', 'riskmap-ia.log'));
 
-// === ESTADO DEL MÓDULO ===
-let state = {
-  isPaused: false,
-  lossesInRow: 0,
-  tradeCount: 0,
-  maxLossStreak: 0,
-  pauseUntil: null,
-  lastUpdate: null,
-  balance: 0,
-  initialBalance: 0,
-  maxDrawdown: 0,
-  maxDrawdownPercent: 0,
-};
+/**
+ * Evalúa el riesgo de una operación propuesta basándose en las condiciones del mercado.
+ *
+ * @param {object} assessmentParams - Parámetros para la evaluación.
+ * @param {object} assessmentParams.signal - La señal de trading propuesta. (Actualmente no se usa, pero se pasa para futuro)
+ * @param {Array} assessmentParams.upcomingEvents - Array de eventos de noticias de alto impacto.
+ * @param {object} assessmentParams.indicators - Objeto con los valores de los indicadores técnicos.
+ * @param {number} assessmentParams.indicators.atr - Valor actual del Average True Range (ATR).
+ *
+ * @returns {{allowed: boolean, reason: string, recommendedStakePct: number}} - El resultado de la evaluación de riesgo.
+ */
+function assessRisk({ signal, upcomingEvents, indicators }) {
+  const now = new Date();
 
-// === CARGAR ESTADO DESDE DISCO ===
-async function loadState() {
-  try {
-    if (await fileExists(config.STATE_FILE)) {
-      const data = await fs.readFile(config.STATE_FILE, 'utf8');
-      const saved = JSON.parse(data);
+  // 1. Comprobar ventana de noticias de alto impacto
+  if (upcomingEvents && upcomingEvents.length > 0) {
+    for (const event of upcomingEvents) {
+      const eventTime = new Date(event.timeUTC);
+      const diffMinutes = Math.abs((eventTime - now) / (1000 * 60));
 
-      // Restaurar solo campos clave con validación
-      state.isPaused = saved.isPaused || false;
-      state.lossesInRow = saved.lossesInRow || 0;
-      state.tradeCount = saved.tradeCount || 0;
-      state.maxLossStreak = saved.maxLossStreak || 0;
-      state.pauseUntil = saved.pauseUntil || null;
-      state.lastUpdate = saved.lastUpdate || null;
-      state.balance = saved.balance || 0;
-      state.initialBalance = saved.initialBalance || 0;
-      state.maxDrawdown = saved.maxDrawdown || 0;
-      state.maxDrawdownPercent = saved.maxDrawdownPercent || 0;
-
-      logger.info(`🟢 RiskMap-IA: Estado cargado. Pérdidas consecutivas: ${state.lossesInRow}/${config.MAX_LOSS_STREAK}`);
-    } else {
-      // Inicializar con valores por defecto
-      await saveState();
-      logger.info('🆕 RiskMap-IA: Estado inicial creado.');
-    }
-  } catch (error) {
-    logger.error(`⚠️ Error al cargar estado de riskmap-ia: ${error.message}`);
-    // Crear estado limpio en caso de error
-    await saveState();
-  }
-}
-
-// === GUARDAR ESTADO EN DISCO ===
-async function saveState() {
-  try {
-    state.lastUpdate = new Date().toISOString();
-    const tempFile = `${config.STATE_FILE}.tmp`;
-    await fs.writeFile(tempFile, JSON.stringify(state, null, 2));
-    await fs.rename(tempFile, config.STATE_FILE);
-  } catch (error) {
-    logger.error(`❌ Error al guardar estado: ${error.message}`);
-  }
-}
-
-// === VERIFICAR SI EXISTE ARCHIVO ===
-async function fileExists(filePath) {
-  try {
-    await fs.access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// === ACTUALIZAR BALANCE ===
-async function updateBalance(newBalance) {
-  try {
-    const previousBalance = state.balance;
-    state.balance = newBalance;
-
-    // Calcular drawdown
-    const drawdown = previousBalance - newBalance;
-    const drawdownPercent = drawdown / state.initialBalance;
-
-    if (drawdown > state.maxDrawdown) {
-      state.maxDrawdown = drawdown;
-      state.maxDrawdownPercent = drawdownPercent;
-      logger.warn(`⚠️ RiskMap-IA: Nuevo drawdown máximo: $${drawdown.toFixed(2)} (${(drawdownPercent * 100).toFixed(1)}%)`);
-    }
-
-    // Verificar si se supera el drawdown máximo permitido
-    if (drawdownPercent > config.MAX_DRAWDOWN_PERCENT) {
-      state.isPaused = true;
-      state.pauseUntil = new Date(Date.now() + 3600000).toISOString(); // Pausar 1 hora
-      logger.error(`🛑 RiskMap-IA: Drawdown máximo superado (${(drawdownPercent * 100).toFixed(1)}%). Bot pausado por 1 hora.`);
-    }
-
-    await saveState();
-  } catch (error) {
-    logger.error(`❌ Error al actualizar balance: ${error.message}`);
-  }
-}
-
-// === REGISTRAR OPERACIÓN ===
-async function registerTrade(result) {
-  try {
-    state.tradeCount++;
-
-    if (result === 'loss') {
-      state.lossesInRow++;
-      if (state.lossesInRow > state.maxLossStreak) {
-        state.maxLossStreak = state.lossesInRow;
+      if (diffMinutes <= config.newsWindowMinutes) {
+        const reason = `Operación denegada: Noticia de alto impacto "${event.event}" para ${event.currency} en ${diffMinutes.toFixed(1)} minutos.`;
+        logger.warn(reason);
+        return {
+          allowed: false,
+          reason,
+          recommendedStakePct: 0,
+        };
       }
-
-      // Verificar si se alcanza el máximo de pérdidas consecutivas
-      if (state.lossesInRow >= config.MAX_LOSS_STREAK) {
-        state.isPaused = true;
-        state.pauseUntil = new Date(Date.now() + config.PAUSE_DURATION * 60000).toISOString();
-        logger.warn(`⏸️ RiskMap-IA: ${config.MAX_LOSS_STREAK} pérdidas consecutivas. Bot pausado por ${config.PAUSE_DURATION} minutos.`);
-      }
-    } else {
-      state.lossesInRow = 0;
-    }
-
-    await saveState();
-  } catch (error) {
-    logger.error(`❌ Error al registrar operación: ${error.message}`);
-  }
-}
-
-// === VERIFICAR ESTADO ACTUAL ===
-function checkStatus() {
-  if (state.isPaused) {
-    const now = new Date();
-    const pauseUntil = new Date(state.pauseUntil);
-
-    if (now >= pauseUntil) {
-      state.isPaused = false;
-      state.pauseUntil = null;
-      state.lossesInRow = 0;
-      logger.info('▶️ RiskMap-IA: Pausa finalizada. Bot reanudado.');
-      saveState();
     }
   }
 
+  // 2. Comprobar volatilidad excesiva (ATR)
+  let recommendedStakePct = config.defaultRiskPct;
+  let reason = 'Riesgo normal. Stake por defecto.';
+
+  if (indicators && indicators.atr && indicators.atr > config.maxAtrThreshold) {
+    recommendedStakePct = config.reducedRiskPct;
+    reason = `Volatilidad alta detectada (ATR: ${indicators.atr.toFixed(2)} > ${config.maxAtrThreshold}). Stake reducido.`;
+    logger.warn(reason);
+  }
+
+  // 3. Si todas las comprobaciones pasan, la operación está permitida.
   return {
-    isPaused: state.isPaused,
-    pauseUntil: state.pauseUntil,
-    lossesInRow: state.lossesInRow,
-    maxLossStreak: state.maxLossStreak,
-    tradeCount: state.tradeCount,
-    balance: state.balance,
-    maxDrawdown: state.maxDrawdown,
-    maxDrawdownPercent: state.maxDrawdownPercent,
+    allowed: true,
+    reason,
+    recommendedStakePct,
   };
 }
 
-// === INICIALIZAR BALANCE ===
-async function initBalance(initialBalance) {
-  try {
-    state.balance = initialBalance;
-    state.initialBalance = initialBalance;
-    await saveState();
-    logger.info(`💰 RiskMap-IA: Balance inicial establecido en $${initialBalance.toFixed(2)}`);
-  } catch (error) {
-    logger.error(`❌ Error al inicializar balance: ${error.message}`);
-  }
-}
-
-// === INICIALIZAR MÓDULO ===
-async function initRiskMapIA() {
-  await loadState();
-  logger.info('🟢 RiskMap-IA: Módulo de gestión de riesgo iniciado.');
-}
-
-// === EXPORTAR MÓDULO ===
 module.exports = {
-  initRiskMapIA,
-  initBalance,
-  updateBalance,
-  registerTrade,
-  checkStatus,
-  getState: () => ({ ...state }),
+  assessRisk,
 };

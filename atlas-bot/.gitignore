@@ -1,0 +1,25 @@
+# Secrets and environment-specific files
+.env
+*.log
+.DS_Store
+
+# Dependencies
+node_modules/
+
+# Application state and data
+# These files store the bot's state and should not be versioned
+automation-state.json
+compound-logic/compound-state.json
+dashboard/dashboard-state.json
+exec-ia/exec-ia-state.json
+geo-eur/geo-eur-state.json
+news-filter/news-filter-state.json
+pred-ia/pred-ia-model.json
+riskmap-ia/riskmap-ia-state.json
+scraping/economic-calendar.json
+scraping/scraping-state.json
+signalrank-ia/signalrank-ia-state.json
+
+# Reports and Logs
+reports/
+logs/
