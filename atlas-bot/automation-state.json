@@ -1,0 +1,14 @@
+{
+  "phase": "demo",
+  "pair": "EURUSD",
+  "duration": 3,
+  "totalOperations": 180,
+  "operationCount": 0,
+  "winCount": 0,
+  "lossCount": 0,
+  "startTime": null,
+  "endTime": null,
+  "status": "initializing",
+  "errors": [],
+  "lastUpdate": null
+}
