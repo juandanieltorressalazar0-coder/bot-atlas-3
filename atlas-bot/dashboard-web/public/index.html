@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kamikaze Rip A.T.L.A.S. - Dashboard</title>
+  <link rel="stylesheet" href="style.css">
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🚀 Kamikaze Rip A.T.L.A.S. - Dashboard</h1>
+      <div id="last-update" class="timestamp">Cargando...</div>
+    </header>
+
+    <div id="alerts-container" class="alerts-hidden">
+      <h2>🔔 Alertas Activas</h2>
+      <div id="alerts" class="alerts-list"></div>
+    </div>
+
+    <div id="countdown" class="countdown">Cargando...</div>
+
+    <div class="modules-grid">
+      <!-- Módulo de Ejecución -->
+      <div class="module-card exec">
+        <h2>🔧 Ejecución (Exec-IA)</h2>
+        <div class="module-content">
+          <div class="status-indicator" id="exec-status">⏳ Cargando...</div>
+          <div class="module-details">
+            <div class="detail-item">
+              <span class="detail-label">Operaciones:</span>
+              <span class="detail-value" id="exec-trades">0</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">Última actualización:</span>
+              <span class="detail-value" id="exec-last-update">N/A</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Módulo de Riesgo -->
+      <div class="module-card risk">
+        <h2>🛡️ Riesgo (RiskMap-IA)</h2>
+        <div class="module-content">
+          <div class="status-indicator" id="risk-status">⏳ Cargando...</div>
+          <div class="module-details">
+            <div class="detail-item">
+              <span class="detail-label">Pérdidas seguidas:</span>
+              <span class="detail-value" id="risk-losses">0</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">Pausa hasta:</span>
+              <span class="detail-value" id="risk-pause">N/A</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Módulo de Interés Compuesto -->
+      <div class="module-card compound">
+        <h2>💰 Interés Compuesto</h2>
+        <div class="module-content">
+          <div class="status-indicator" id="compound-status">⏳ Cargando...</div>
+          <div class="module-details">
+            <div class="detail-item">
+              <span class="detail-label">Operaciones:</span>
+              <span class="detail-value" id="compound-trades">0</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">Lote actual:</span>
+              <span class="detail-value" id="compound-lot">$0.00</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Módulo de Fusión de Señales -->
+      <div class="module-card signalrank">
+        <h2>🔀 Fusión de Señales</h2>
+        <div class="module-content">
+          <div class="status-indicator" id="signalrank-status">⏳ Cargando...</div>
+          <div class="module-details">
+            <div class="detail-item">
+              <span class="detail-label">Señales procesadas:</span>
+              <span class="detail-value" id="signalrank-total">0</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">Señales filtradas:</span>
+              <span class="detail-value" id="signalrank-filtered">0</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">Confianza promedio:</span>
+              <span class="detail-value" id="signalrank-confidence">0%</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Módulo de Noticias -->
+      <div class="module-card news">
+        <h2>📰 Noticias</h2>
+        <div class="module-content">
+          <div class="status-indicator" id="news-status">⏳ Cargando...</div>
+          <div class="module-details">
+            <div class="detail-item">
+              <span class="detail-label">Ventana activa:</span>
+              <span class="detail-value" id="news-active">No</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">Evento actual:</span>
+              <span class="detail-value" id="news-event">Ninguno</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">Próxima verificación:</span>
+              <span class="detail-value" id="news-next-check">N/A</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Configuración
+    const refreshInterval = 5000; // 5 segundos
+    let state = {};
+
+    // Función para actualizar el dashboard
+    async function updateDashboard() {
+      try {
+        const response = await fetch('/api/state');
+        state = await response.json();
+
+        // Actualizar última actualización
+        document.getElementById('last-update').textContent = `Última actualización: ${state.time}`;
+
+        // Actualizar countdown
+        const countdownElement = document.getElementById('countdown');
+        if (state.countdown !== null) {
+          countdownElement.textContent = `Próxima operación en: ${state.countdown} segundos`;
+        } else {
+          countdownElement.textContent = 'Intervalo de operación no disponible';
+        }
+
+        // Actualizar alertas
+        const alertsContainer = document.getElementById('alerts');
+        const alertsList = document.getElementById('alerts');
+        if (state.alerts && state.alerts.length > 0) {
+          document.getElementById('alerts-container').classList.remove('alerts-hidden');
+          alertsList.innerHTML = state.alerts.map(alert =>
+            `<div class="alert-item">${alert.message}</div>`
+          ).join('');
+        } else {
+          document.getElementById('alerts-container').classList.add('alerts-hidden');
+          alertsList.innerHTML = '<div class="no-alerts">No hay alertas activas</div>';
+        }
+
+        // Actualizar módulo de Ejecución
+        document.getElementById('exec-status').textContent = state.exec.status;
+        document.getElementById('exec-status').className = `status-indicator ${state.exec.status.includes('✅') ? 'status-active' : 'status-inactive'}`;
+        document.getElementById('exec-trades').textContent = state.exec.tradeCount;
+        document.getElementById('exec-last-update').textContent = state.exec.lastUpdate;
+
+        // Actualizar módulo de Riesgo
+        document.getElementById('risk-status').textContent = state.risk.status;
+        document.getElementById('risk-status').className = `status-indicator ${state.risk.status.includes('✅') ? 'status-active' : state.risk.status.includes('⏸️') ? 'status-paused' : 'status-inactive'}`;
+        document.getElementById('risk-losses').textContent = state.risk.lossesInRow;
+        document.getElementById('risk-pause').textContent = state.risk.pauseUntil;
+
+        // Actualizar módulo de Interés Compuesto
+        document.getElementById('compound-status').textContent = state.compound.status;
+        document.getElementById('compound-status').className = 'status-indicator status-active';
+        document.getElementById('compound-trades').textContent = state.compound.tradeCount;
+        document.getElementById('compound-lot').textContent = state.compound.currentLot;
+
+        // Actualizar módulo de Fusión de Señales
+        document.getElementById('signalrank-status').textContent = state.signalrank.status;
+        document.getElementById('signalrank-status').className = 'status-indicator status-active';
+        document.getElementById('signalrank-total').textContent = state.signalrank.totalSignals;
+        document.getElementById('signalrank-filtered').textContent = state.signalrank.filtered;
+        document.getElementById('signalrank-confidence').textContent = state.signalrank.avgConfidence;
+
+        // Actualizar módulo de Noticias
+        document.getElementById('news-status').textContent = state.news.status;
+        document.getElementById('news-status').className = `status-indicator ${state.news.status.includes('🔴') ? 'status-paused' : 'status-active'}`;
+        document.getElementById('news-active').textContent = state.news.status.includes('🔴') ? 'Sí' : 'No';
+        document.getElementById('news-event').textContent = state.news.currentEvent;
+        document.getElementById('news-next-check').textContent = state.news.nextCheck;
+
+      } catch (error) {
+        console.error('Error al actualizar dashboard:', error);
+      }
+    }
+
+    // Iniciar actualización periódica
+    updateDashboard();
+    setInterval(updateDashboard, refreshInterval);
+  </script>
+</body>
+</html>
